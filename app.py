@@ -69,21 +69,70 @@ def opds_search(term, limit=15):
     feed = SESSION.get(url, headers=HEADERS, timeout=15).content
     root = ET.fromstring(feed)
     ns = {"a": "http://www.w3.org/2005/Atom"}
-    out = {}
+    books = {}
     for entry in root.findall("a:entry", ns)[:limit]:
-        hrefs = [ln.attrib["href"] for ln in entry.findall("a:link", ns)
-                 if "acquisition" in ln.attrib.get("rel", "")]
-        if not hrefs:
+        # ---------- ID и форматы ----------
+        links = entry.findall("a:link", ns)
+        fmt_map, bid = {}, None
+        for ln in links:
+            rel = ln.attrib.get("rel", "")
+            href = ln.attrib.get("href", "")
+            if "acquisition" in rel and "/b/" in href:
+                m = re.search(r"/b/(\d+)/", href)
+                if m:
+                    bid = m.group(1)
+                # определяем формат по MIME‑type
+                mime = ln.attrib.get("type", "")
+                fmt = (
+                    "fb2" if "fb2" in mime else
+                    "epub" if "epub" in mime else
+                    "mobi" if "mobipocket" in mime else
+                    "txt" if "text/plain" in mime else "bin"
+                )
+                fmt_map[fmt] = {
+                    "url":   urljoin(BASE, href),
+                    "size":  int(ln.attrib.get("length", 0)),
+                    "title": ln.attrib.get("title", fmt.upper())
+                }
+            elif rel == "alternate":
+                alt_url = urljoin(BASE, href)
+            elif "image/thumbnail" in rel:
+                thumb = urljoin(BASE, href)
+            elif "image" == rel.split("/")[-1]:
+                cover = urljoin(BASE, href)
+
+        if not bid:            # без ID смысла нет
             continue
-        m = re.search(r"/b/(\d+)/", hrefs[0])
-        if not m:
-            continue
-        bid = m.group(1)
-        title = entry.findtext("a:title", "", ns)
+
+        # ---------- прочие поля ----------
+        title = entry.findtext("a:title", "", ns).strip()
+        content = entry.findtext("a:content", "", ns).strip()
         authors = ", ".join(
             a.text for a in entry.findall("a:author/a:name", ns))
-        out[bid] = f"{title} / {authors}"
-    return out
+
+        # TODO: проблема с ns
+        # published = entry.findtext("a:published", "", ns)[:4]  # год
+        # language = entry.findtext("dc:language", "", ns)
+        # publisher = entry.findtext("dc:publisher", "", ns)
+
+        genres = [cat.attrib.get("label", cat.attrib.get("term", ""))
+                  for cat in entry.findall("a:category", ns)]
+
+        books[bid] = {
+            "id":        bid,
+            "title":     title,
+            "authors":   authors,
+            "content":   content,
+            # "year":      published,
+            # "language":  language,
+            # "publisher": publisher,
+            "genres":    genres,
+            "cover":     cover if 'cover' in locals() else None,
+            "thumb":     thumb if 'thumb' in locals() else None,
+            "html":      alt_url if 'alt_url' in locals() else None,
+            "formats":   fmt_map
+        }
+    return books
 
 
 FMT_DEFAULT = "fb2"
@@ -124,7 +173,3 @@ def download_book(book_id: str,
             f.write(chunk)
 
     return path
-
-
-books = opds_search("маяковский").items()
-print('CHECK', download_book(442533))
