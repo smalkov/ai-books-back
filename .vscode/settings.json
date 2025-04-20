@@ -1,0 +1,27 @@
+{
+  "sqltools.connections": [
+    {
+      "mysqlOptions": {
+        "authProtocol": "default",
+        "enableSsl": "Disabled"
+      },
+      "previewLimit": 50,
+      "server": "127.0.0.1",
+      "port": 3306,
+      "driver": "MySQL",
+      "name": "local-mysql",
+      "username": "root",
+      "database": "libdb",
+      "password": ""
+    }
+  ],
+  "[python]": {
+    "editor.insertSpaces": true, // всегда пробелы
+    "editor.tabSize": 4, // PEP 8
+    "editor.detectIndentation": false, // не менять автоматически
+    "editor.defaultFormatter": "ms-python.autopep8",
+    "editor.formatOnSave": true
+  },
+  "editor.guides.indentation": true,
+  "editor.guides.highlightActiveIndentation": true
+}

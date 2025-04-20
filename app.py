@@ -1,108 +1,130 @@
-from flask import Flask, jsonify, request, Response
-from flask_cors import CORS  # <-- импорт CORS
-import json
 import re
+import xml.etree.ElementTree as ET
+import cloudscraper
+import requests
+import itertools
+import os
+from urllib.parse import quote_plus, urljoin
 
-app = Flask(__name__)
-CORS(app)  # <-- разрешаем всем доменам обращаться к эндпоинтам
+HEADERS = {"User-Agent": "flibusta-client/1.0",
+           "Accept": "application/atom+xml"}
 
-ALL_ROWS = None
+MIRRORS = [
+    "https://flibusta.monster",          # рабочий TLS, без CF
+    "https://flibusta.site",             # CF => cloudscraper
+    "https://flibusta.is",               # self‑signed TLS
+    "https://flibusta.su",               # OPDS выкл.
+]
 
-def parse_insert_statements(sql_path: str):
-    with open(sql_path, "r", encoding="utf-8") as f:
-        content = f.read()
 
-    pattern = r"INSERT\s+INTO\s+`libbook`\s+VALUES\s*\((.+?)\);"
-    matches = re.findall(pattern, content, flags=re.DOTALL)
+def get_session(url):
+    if ".site" in url:
+        return cloudscraper.create_scraper()
+    s = requests.Session()
+    if ".is" in url:                     # игнорируем кривой cert
+        s.verify = False
+    return s
 
-    all_rows = []
-    for match in matches:
-        row_strs = re.split(r"\)\s*,\s*\(", match)
-        for row_str in row_strs:
-            row_str = row_str.strip().lstrip("(").rstrip(")")
-            fields = split_fields(row_str)
-            all_rows.append(fields)
 
-    return all_rows
+def pick_mirror():
+    for base in MIRRORS:
+        s = get_session(base)
+        try:
+            r = s.get(f"{base}/opds", timeout=10)
+            if r.status_code == 200 and r.headers["content-type"].startswith("application/atom+xml"):
+                print(" ✓", base)
+                return base, s
+        except requests.RequestException:
+            print(" ✗", base)
+    raise RuntimeError("Нет доступных зеркал с OPDS")
 
-def split_fields(row_str: str):
-    fields = []
-    current = []
-    in_quotes = False
-    quote_char = None
 
-    for ch in row_str:
-        if ch in ("'", '"'):
-            if not in_quotes:
-                in_quotes = True
-                quote_char = ch
-            elif in_quotes and ch == quote_char:
-                in_quotes = False
-                quote_char = None
-            else:
-                current.append(ch)
-        elif ch == "," and not in_quotes:
-            fields.append("".join(current).strip())
-            current = []
-        else:
-            current.append(ch)
+BASE, SESSION = pick_mirror()
 
-    if current:
-        fields.append("".join(current).strip())
 
-    cleaned = []
-    for f in fields:
-        if len(f) >= 2 and f[0] == f[-1] and f[0] in ("'", '"'):
-            f = f[1:-1]
-        cleaned.append(f)
+def _search_template():
+    # 1. корневой /opds
+    root = ET.fromstring(SESSION.get(f"{BASE}/opds", headers=HEADERS).content)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    # 2. берём ссылку rel="search" (любую), а не ковыряем contains()
+    for ln in root.findall(".//a:link[@rel='search']", ns):
+        href = ln.attrib["href"]
+        if href.endswith("xml"):              # opensearch
+            tmpl = ET.fromstring(
+                SESSION.get(urljoin(BASE, href), headers=HEADERS).content
+            ).find(".//{http://a9.com/-/spec/opensearch/1.1/}Url"
+                   "[@type='application/atom+xml']").attrib["template"]
+            return tmpl
+        if "search?" in href:                 # прямой шаблон
+            return urljoin(BASE, href)
+    raise RuntimeError("OPDS‑поиск не объявлен")
 
-    return cleaned
 
-def rows_to_dicts(rows):
+SEARCH_TMPL = _search_template()
+
+
+def opds_search(term, limit=15):
+    url = (SEARCH_TMPL.replace("{searchTerms}", quote_plus(term))
+           .replace("{startPage?}", "0"))
+    feed = SESSION.get(url, headers=HEADERS, timeout=15).content
+    root = ET.fromstring(feed)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    out = {}
+    for entry in root.findall("a:entry", ns)[:limit]:
+        hrefs = [ln.attrib["href"] for ln in entry.findall("a:link", ns)
+                 if "acquisition" in ln.attrib.get("rel", "")]
+        if not hrefs:
+            continue
+        m = re.search(r"/b/(\d+)/", hrefs[0])
+        if not m:
+            continue
+        bid = m.group(1)
+        title = entry.findtext("a:title", "", ns)
+        authors = ", ".join(
+            a.text for a in entry.findall("a:author/a:name", ns))
+        out[bid] = f"{title} / {authors}"
+    return out
+
+
+FMT_DEFAULT = "fb2"
+
+
+def _safe_filename(name: str) -> str:
+    """Очищает имя файла от запрещённых символов Windows/macOS/Linux."""
+    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+
+
+def download_book(book_id: str,
+                  fmt: str = FMT_DEFAULT,
+                  dest_dir: str = "downloads") -> str:
     """
-    Превращает список списков в список словарей
-    с ключами key1, key2, ... и значениями из rows.
+    Скачивает файл `/b/<id>/<fmt>` с текущего зеркала и возвращает путь.
+
+    :param book_id: строковый ID книги, например "16631"
+    :param fmt:     "fb2", "epub", "mobi", "txt" …
+    :param dest_dir: каталог для сохранения (создаётся при отсутствии)
     """
-    result = []
-    for row in rows:
-        row_dict = {}
-        for i, value in enumerate(row, start=1):
-            row_dict[f"key{i}"] = value
-        result.append(row_dict)
-    return result
+    url = f"{BASE}/b/{book_id}/{fmt}"
+    r = SESSION.get(url, stream=True, timeout=60)
+    r.raise_for_status()
 
-@app.route('/api/libbooks', methods=['GET'])
-def get_libbooks():
-    global ALL_ROWS
-    if ALL_ROWS is None:
-        ALL_ROWS = parse_insert_statements("lib.libbook.sql")
+    # пытаемся извлечь имя из Content‑Disposition; иначе делаем своё
+    filename = f"{book_id}.{fmt}"
+    cd = r.headers.get("Content-Disposition", "")
+    m = re.search(r'filename="?(?P<name>[^"]+)"?', cd)
+    if m:
+        filename = _safe_filename(m.group("name").encode("latin1")
+                                  .decode("utf‑8", "ignore"))
 
-    page = request.args.get("page", default=1, type=int)
-    limit = request.args.get("limit", default=50, type=int)
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, filename)
 
-    if page < 1:
-        page = 1
-    if limit < 1:
-        limit = 1
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1 << 15):
+            f.write(chunk)
 
-    total = len(ALL_ROWS)
-    start = (page - 1) * limit
-    end = start + limit
-    data_slice = ALL_ROWS[start:end]
+    return path
 
-    data_page = rows_to_dicts(data_slice)
 
-    response = {
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "data": data_page
-    }
-
-    # Вместо jsonify используем Response + json.dumps(..., ensure_ascii=False).
-    # Это позволит вернуть русские символы без \uXXXX.
-    json_str = json.dumps(response, ensure_ascii=False)
-    return Response(json_str, content_type='application/json; charset=utf-8')
-
-if __name__ == "__main__":
-    app.run(debug=True)
+books = opds_search("маяковский").items()
+print('CHECK', download_book(442533))
